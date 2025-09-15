@@ -68,7 +68,7 @@ if __name__ == "__main__":
     # Hyperparameters
     LEARNING_RATE = 0.001
     BATCH_SIZE = 16
-    NUM_EPOCHS = 10
+    NUM_EPOCHS = 50
     IMG_HEIGHT = 96
 
     # Model dimensions

@@ -6,122 +6,132 @@ from Encoder import Encoder
 from DecoderWithAttention import DecoderWithAttention
 from Vocabulary import Vocabulary
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE = 4
+IMG_HEIGHT = 96  # Must match value in Cell 2
+NUM_EPOCHS = 20
+LEARNING_RATE = 1e-3
+ACCUMULATION_STEPS = 2
+
+# Model Dimensions
+
 EMBED_DIM = 256
 ATTENTION_DIM = 256
 DECODER_DIM = 512
-IMG_HEIGHT = 96
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+ENCODER_DIM = 512
+
+print(f"Using device: {DEVICE}")
+print(f"Actual Batch Size: {BATCH_SIZE}")
+print(f"Effective Batch Size (with accumulation): {BATCH_SIZE * ACCUMULATION_STEPS}")
+
+## PATHS
+ENCODER_PATH = "./encoder.pth"
+DECODER_PATH = "./decoder.pth"
+VOCAB_PATH = "./vocab.pth"
+NUMPY_FILE = "./data/preprocessed_data.npz"
+BASE_PATH = "."
 
 
 def predict(encoder, decoder, image_path, vocab, device, transforms, max_length=150):
-    """
-    Takes a trained model and an image, and returns the predicted LaTeX string.
-    """
     encoder.eval()
     decoder.eval()
 
-    # 1. Load and preprocess the image
     try:
         image = Image.open(image_path).convert("L")
-        image = transforms(image).unsqueeze(0)  # Add batch dimension
-        image = image.to(device)
     except FileNotFoundError:
         print(f"Error: Image not found at {image_path}")
         return None
 
-    # 2. Pass image through the encoder
+    image = transforms(image).unsqueeze(0).to(device)
+
     with torch.no_grad():
         features = encoder(image)
         num_pixels = features.size(2) * features.size(3)
-        features = features.permute(0, 2, 3, 1)  # -> (B, H, W, C)
-        features = features.view(1, num_pixels, decoder.encoder_dim)
+        features = features.permute(0, 2, 3, 1).reshape(
+            1, num_pixels, decoder.encoder_dim
+        )
 
-    # 3. Auto-regressive decoding loop
     predicted_sequence = [vocab.stoi["<start>"]]
-
-    # Initialize decoder hidden state
     h, c = decoder.init_hidden_state(features)
 
-    for t in range(max_length):
-        # Get the last predicted token
-        previous_token = torch.LongTensor([predicted_sequence[-1]]).to(device)
+    for _ in range(max_length):
+        previous_word = torch.tensor([predicted_sequence[-1]]).to(device)
+        embeddings = decoder.embedding(previous_word)
 
-        with torch.no_grad():
-            # Get embeddings and context vector
-            embeddings = decoder.embedding(previous_token)
-            attention_weighted_encoding, _ = decoder.attention(features, h)
-            gate = decoder.sigmoid(decoder.f_beta(h))
-            attention_weighted_encoding = gate * attention_weighted_encoding
+        awe, _ = decoder.attention(features, h)
+        gate = decoder.sigmoid(decoder.f_beta(h))
+        awe = gate * awe
 
-            # Run through LSTM cell
-            lstm_input = torch.cat((embeddings, attention_weighted_encoding), dim=1)
-            h, c = decoder.decode_step(lstm_input, (h, c))
+        h, c = decoder.decode_step(torch.cat([embeddings, awe], dim=1), (h, c))
+        output = decoder.fc(h)
+        predicted_token = output.argmax(1).item()
 
-            # Get prediction
-            output = decoder.fc(h)
-            top_prediction = output.argmax(1)
-
-        predicted_sequence.append(top_prediction.item())
-
-        # Stop if we predict the <end> token
-        if top_prediction.item() == vocab.stoi["<end>"]:
+        predicted_sequence.append(predicted_token)
+        if predicted_token == vocab.stoi["<end>"]:
             break
 
-    # 4. Convert token IDs back to characters
-    output_latex = []
-    for token_idx in predicted_sequence:
-        # Skip <start> token in the final output
-        if token_idx == vocab.stoi["<start>"]:
-            continue
-        # Stop at <end> token
-        if token_idx == vocab.stoi["<end>"]:
-            break
-        output_latex.append(vocab.itos[token_idx])
-
-    return "".join(output_latex)
+    return "".join([vocab.itos[idx] for idx in predicted_sequence[1:-1]])
 
 
-# Create a dummy image for prediction if it doesn't exist
-prediction_image_path = "./example/avg.png"
-if not os.path.exists(prediction_image_path):
-    print(f"Creating a dummy image for prediction at: {prediction_image_path}")
-    pred_img = Image.new("L", (400, 96), "white")
-    draw = ImageDraw.Draw(pred_img)
-    # Using a simple text draw, but in reality, this would be your handwritten image
-    draw.text((10, 30), "x^2 + y^2 = z^2", fill="black", font_size=30)
-    pred_img.save(prediction_image_path)
+def run_inference():
+    print("--- Running Inference Example ---")
 
-print("Loading trained model weights...")
+    prediction_image_path = os.path.join(BASE_PATH, "onepone.png")
+    if not os.path.exists(prediction_image_path):
+        print(f"Creating a dummy image for prediction at: {prediction_image_path}")
+        pred_img = Image.new("L", (400, 100), color=255)
+        draw = ImageDraw.Draw(pred_img)
+        draw.text((10, 30), "x^2 + y^2 = z^2", fill="black")
+        pred_img.save(prediction_image_path)
 
-vocab = torch.load("vocab.pth", weights_only=False)
-encoder_pred = Encoder().to(DEVICE)
-decoder_pred = DecoderWithAttention(
-    attention_dim=ATTENTION_DIM,
-    embed_dim=EMBED_DIM,
-    decoder_dim=DECODER_DIM,
-    vocab_size=len(vocab),
-).to(DEVICE)
+    print("Loading trained model weights and vocabulary...")
+    try:
+        vocab_pred = torch.load(VOCAB_PATH, weights_only=False)
+    except FileNotFoundError:
+        print("Vocabulary file not found. Please train the model first.")
+        return
 
-encoder_pred.load_state_dict(torch.load("encoder.pth"))
-decoder_pred.load_state_dict(torch.load("decoder.pth"))
+    encoder_pred = Encoder().to(DEVICE)
+    decoder_pred = DecoderWithAttention(
+        attention_dim=ATTENTION_DIM,
+        embed_dim=EMBED_DIM,
+        decoder_dim=DECODER_DIM,
+        vocab_size=len(vocab_pred),
+    ).to(DEVICE)
 
-image_transforms = transforms.Compose(
-    [
-        transforms.Resize((IMG_HEIGHT, 512)),  # Resize to a large fixed size first
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,)),
-    ]
-)
-# 2. Run the prediction function
-predicted_latex = predict(
-    encoder=encoder_pred,
-    decoder=decoder_pred,
-    image_path=prediction_image_path,
-    vocab=vocab,
-    device=DEVICE,
-    transforms=image_transforms,
-)
+    try:
+        encoder_pred.load_state_dict(torch.load(ENCODER_PATH))
+        decoder_pred.load_state_dict(torch.load(DECODER_PATH))
+    except FileNotFoundError:
+        print("Model weights not found. Please train the model first.")
+        return
 
-if predicted_latex is not None:
-    print(f"\nImage Path: {prediction_image_path}")
-    print(f"Predicted LaTeX: {predicted_latex}")
+    # Use the same transforms as training for consistency
+    pred_transforms = transforms.Compose(
+        [
+            transforms.Lambda(
+                lambda image: image.resize(
+                    (int(image.width * IMG_HEIGHT / image.height), IMG_HEIGHT)
+                )
+            ),
+            transforms.ToTensor(),
+        ]
+    )
+
+    predicted_latex = predict(
+        encoder=encoder_pred,
+        decoder=decoder_pred,
+        image_path=prediction_image_path,
+        vocab=vocab_pred,
+        device=DEVICE,
+        transforms=pred_transforms,
+    )
+
+    if predicted_latex is not None:
+        print(f"\nImage Path: {prediction_image_path}")
+        print(f"Predicted LaTeX: {predicted_latex}")
+
+
+# --- Run inference ---
+run_inference()
+print("Inference cell is ready. Uncomment 'run_inference()' to predict on an image.")

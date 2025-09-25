@@ -18,5 +18,8 @@ class Vocabulary:
         for char, _ in char_counter.items():
             self.add_char(char)
 
+    def numericalize(self, text):
+        return [self.stoi.get(char, self.stoi["<unk>"]) for char in text]
+
     def __len__(self):
         return len(self.itos)
